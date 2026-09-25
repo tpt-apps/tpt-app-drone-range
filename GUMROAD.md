@@ -24,8 +24,23 @@ that changes, update here too (and vice versa).
 
 ## File to upload
 
-Not built yet. Once packaged, this will be the Pro exe/zip produced by the
-app's `build.ps1 -Pro` (or equivalent) — see `todo.md`.
+```
+target\release\tpt-drone-range-pro.exe
+```
+
+Produced by `./build.ps1 -Pro` (trunk pro bundle → dist\, then the native
+webview exe). The exe embeds its whole web bundle at compile time and
+extracts it to the user's temp dir on first launch — ship the exe **zipped**
+(Gumroad wants an archive; some browsers also flag bare exes):
+
+```powershell
+Compress-Archive -Path target\release\tpt-drone-range-pro.exe `
+  -DestinationPath release\TPT-Drone-Range-Pro.zip -Force
+```
+
+Smoke test before upload: double-click the exe — the app window opens with
+the comparison, payload trade-off, and saved-profiles panels present and no
+"Pro edition" upsell card (that card only exists in the free build).
 
 ## Product name
 
@@ -87,6 +102,10 @@ preinstalled on both — nothing extra to download.
 
 Not created yet. A screenshot comparing two build configurations
 side-by-side is the most convincing cover once built. No stock/AI art.
+Source for the shot: run the Pro exe, load the freestyle sample, pin it,
+then load the long-range wing sample and pin that — the comparison table
+plus the payload chart fills a clean cover crop. (The free build's
+flight-envelope chart in light mode also works as a backdrop.)
 
 ## After publishing
 
