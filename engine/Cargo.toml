@@ -1,0 +1,13 @@
+[package]
+name = "tpt-drone-engine"
+version = "0.1.0"
+edition = "2021"
+description = "Flight-performance estimator for custom drone builds: motor/prop/battery/airframe/payload specs in, range, endurance and payload trade-offs out. Pure Rust, no UI deps."
+publish = false
+
+[features]
+default = []
+# Pro edition capability: the payload trade-off sweep (range/endurance vs
+# payload-mass curve). Compiled out of the free WASM build to keep the tier
+# boundary structural, not just a UI flag.
+pro = []
