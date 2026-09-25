@@ -19,7 +19,22 @@ use wasm_bindgen::JsCast;
 #[derive(Clone)]
 enum Outcome {
     Idle,
-    Solved(Rc<Estimate>),
+    Solved(Rc<SolvedRun>),
+}
+
+/// One solved run: the estimate plus the spec it came from (the Pro payload
+/// sweep re-solves the spec at increasing payload masses).
+struct SolvedRun {
+    spec: Rc<BuildSpec>,
+    est: Rc<Estimate>,
+}
+
+/// (pro) One pinned column in the configuration comparison.
+#[cfg(feature = "pro")]
+#[derive(Clone)]
+struct CompareRow {
+    name: String,
+    est: Rc<Estimate>,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +47,21 @@ enum Msg {
     /// away from the local `app://` bundle with no way back). See
     /// [`visit_site`].
     VisitSite(String),
+    /// (pro) pin the current solve into the comparison table.
+    #[cfg(feature = "pro")]
+    CompareSnapshot,
+    /// (pro) empty the comparison table.
+    #[cfg(feature = "pro")]
+    CompareClear,
+    /// (pro) save the current spec under the profile-name field.
+    #[cfg(feature = "pro")]
+    SaveProfile,
+    /// (pro) load a saved profile into the form and solve it.
+    #[cfg(feature = "pro")]
+    LoadProfile(String),
+    /// (pro) delete a saved profile.
+    #[cfg(feature = "pro")]
+    DeleteProfile(String),
 }
 
 const BASE_CSS: &str = r#"
@@ -73,6 +103,15 @@ const BASE_CSS: &str = r#"
 .drn-upsell ul{margin:8px 0 12px;padding-left:20px}
 .drn-upsell li{margin:3px 0}
 .drn-foot{color:var(--drn-muted);font-size:12.5px;text-align:center;margin-top:18px}
+.drn-compare-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:10px}
+.drn-compare-col{background:var(--drn-panel);border-radius:8px;padding:10px 12px}
+.drn-compare-col .n{font-weight:700;margin-bottom:6px}
+.drn-compare-col .r{font-size:12.5px;margin:2px 0;color:var(--drn-fg)}
+.drn-compare-col .r b{color:var(--drn-muted);font-weight:400}
+.drn-profile-row{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--drn-border)}
+.drn-profile-row .pn{flex:1;font-weight:600}
+.drn-mini{font:inherit;font-size:12.5px;background:var(--drn-panel);color:var(--drn-fg);border:1px solid var(--drn-border);border-radius:6px;padding:4px 10px;cursor:pointer}
+.drn-mini:hover{border-color:var(--drn-accent);color:var(--drn-accent)}
 "#;
 
 /// Entry from [`mount_app`]: builds the static panel and wires the
@@ -98,10 +137,19 @@ pub fn mount_app(container: &web_sys::Element) -> Result<(), JsValue> {
     }
 
     let outcome: Signal<Outcome> = Signal::new(Outcome::Idle);
+    // (pro) pinned comparison columns and the saved-profile name list.
+    #[cfg(feature = "pro")]
+    let compare: Signal<Vec<CompareRow>> = Signal::new(Vec::new());
+    #[cfg(feature = "pro")]
+    let profiles: Signal<Vec<String>> = Signal::new(list_profiles());
 
     let dispatch: Rc<dyn Fn(Msg)> = {
         let container = container.clone();
         let outcome = outcome.clone();
+        #[cfg(feature = "pro")]
+        let compare = compare.clone();
+        #[cfg(feature = "pro")]
+        let profiles = profiles.clone();
         Rc::new(move |msg| match msg {
             Msg::Solve => run_solve(&container, &outcome),
             Msg::Sample(index) => {
@@ -109,6 +157,59 @@ pub fn mount_app(container: &web_sys::Element) -> Result<(), JsValue> {
                 run_solve(&container, &outcome);
             }
             Msg::VisitSite(url) => visit_site(&url),
+            #[cfg(feature = "pro")]
+            Msg::CompareSnapshot => {
+                if let Outcome::Solved(run) = outcome.get() {
+                    let mut rows = compare.get();
+                    if rows.len() < 4 {
+                        rows.push(CompareRow {
+                            name: run.spec.name.clone(),
+                            est: Rc::clone(&run.est),
+                        });
+                        compare.set(rows);
+                    }
+                }
+            }
+            #[cfg(feature = "pro")]
+            Msg::CompareClear => compare.set(Vec::new()),
+            #[cfg(feature = "pro")]
+            Msg::SaveProfile => {
+                let name = read_input(&container, ".drn-profile-name");
+                let name = name.trim();
+                if !name.is_empty() {
+                    if let Ok(spec) = read_spec(&container) {
+                        let name = name.replace('|', "/");
+                        if let Some(store) = storage() {
+                            let _ = store.set_item(
+                                &format!("{PROFILE_PREFIX}{name}"),
+                                &encode_spec(&spec),
+                            );
+                        }
+                        profiles.set(list_profiles());
+                    }
+                }
+            }
+            #[cfg(feature = "pro")]
+            Msg::LoadProfile(name) => {
+                if let Some(encoded) = storage().and_then(|store| {
+                    store
+                        .get_item(&format!("{PROFILE_PREFIX}{name}"))
+                        .ok()
+                        .flatten()
+                }) {
+                    if let Some(spec) = decode_spec(&encoded) {
+                        apply_spec(&container, &spec);
+                        run_solve(&container, &outcome);
+                    }
+                }
+            }
+            #[cfg(feature = "pro")]
+            Msg::DeleteProfile(name) => {
+                if let Some(store) = storage() {
+                    let _ = store.remove_item(&format!("{PROFILE_PREFIX}{name}"));
+                }
+                profiles.set(list_profiles());
+            }
         })
     };
 
@@ -162,11 +263,66 @@ pub fn mount_app(container: &web_sys::Element) -> Result<(), JsValue> {
 
     let chart_effect_outcome = outcome.clone();
     let handle = create_effect(move || {
-        if let Outcome::Solved(est) = chart_effect_outcome.get() {
-            let _ = draw_envelope_chart(&canvas, &est);
+        if let Outcome::Solved(run) = chart_effect_outcome.get() {
+            let _ = draw_envelope_chart(&canvas, &run.est);
         }
     });
     std::mem::forget(handle);
+
+    // 4. (pro) comparison table, payload trade-off chart, saved profiles.
+    #[cfg(feature = "pro")]
+    {
+        // Comparison: re-renders when the pinned rows change; the highlight
+        // of the best value per row needs the rows only.
+        let compare_holder = container
+            .query_selector(".drn-compare")?
+            .ok_or_else(|| JsValue::from_str("compare placeholder missing"))?;
+        let compare_for_render = compare.clone();
+        let handle = tpt_appfront_dom::render(
+            &compare_holder,
+            Rc::new(move || compare_view(compare_for_render.clone())),
+            dispatch.clone(),
+        )?;
+        std::mem::forget(handle);
+
+        // Payload trade-off: canvas + effect re-solving the current spec at
+        // increasing payload masses on every outcome change.
+        let payload_holder = container
+            .query_selector(".drn-payload-chart-holder")?
+            .ok_or_else(|| JsValue::from_str("payload chart placeholder missing"))?;
+        let payload_canvas: web_sys::HtmlCanvasElement = document
+            .create_element("canvas")?
+            .dyn_into()
+            .map_err(|_| JsValue::from_str("payload canvas cast failed"))?;
+        payload_canvas.set_width(920);
+        payload_canvas.set_height(300);
+        let _ = payload_canvas.set_attribute("class", "drn-chart");
+        payload_holder.append_child(&payload_canvas)?;
+
+        let payload_effect_outcome = outcome.clone();
+        let handle = create_effect(move || {
+            if let Outcome::Solved(run) = payload_effect_outcome.get() {
+                if run.est.feasible {
+                    let cap_g = run.est.all_up_weight_g * 2.0;
+                    let points = tpt_drone_engine::payload_sweep(&run.spec, cap_g, 48);
+                    let _ = draw_payload_chart(&payload_canvas, &points);
+                }
+            }
+        });
+        std::mem::forget(handle);
+
+        // Saved profiles: the list re-renders from the profiles signal.
+        let profiles_holder = container
+            .query_selector(".drn-profiles-list")?
+            .ok_or_else(|| JsValue::from_str("profiles placeholder missing"))?;
+        let profiles_for_render = profiles.clone();
+        let handle = tpt_appfront_dom::render(
+            &profiles_holder,
+            Rc::new(move || profiles_view(profiles_for_render.clone())),
+            dispatch.clone(),
+        )?;
+        std::mem::forget(handle);
+    }
 
     Ok(())
 }
@@ -176,6 +332,11 @@ fn apply_sample(container: &web_sys::Element, index: usize) {
     let Some(spec) = SAMPLE_BUILDS.get(index) else {
         return;
     };
+    apply_spec(container, spec);
+}
+
+/// Writes a [`BuildSpec`] into the form fields.
+fn apply_spec(container: &web_sys::Element, spec: &BuildSpec) {
     write_field(container, ".drn-name", &spec.name);
     let kind = match spec.kind {
         AirframeKind::Multirotor => "multirotor",
@@ -326,15 +487,65 @@ fn read_spec(container: &web_sys::Element) -> Result<BuildSpec, Vec<String>> {
 /// Runs the solve and publishes the outcome (or the field-parse issues).
 fn run_solve(container: &web_sys::Element, outcome: &Signal<Outcome>) {
     match read_spec(container) {
-        Ok(spec) => outcome.set(Outcome::Solved(Rc::new(solve(&spec)))),
+        Ok(spec) => {
+            let est = solve(&spec);
+            outcome.set(Outcome::Solved(Rc::new(SolvedRun {
+                spec: Rc::new(spec),
+                est: Rc::new(est),
+            })));
+        }
         Err(errors) => {
             let est = tpt_drone_engine::Estimate {
                 feasible: false,
                 issues: errors.into_iter().map(SolveIssue::Error).collect(),
                 ..blank_estimate()
             };
-            outcome.set(Outcome::Solved(Rc::new(est)));
+            // The spec is unparsable; carry a placeholder so the payload
+            // sweep and comparison have nothing to chew on.
+            outcome.set(Outcome::Solved(Rc::new(SolvedRun {
+                spec: Rc::new(blank_spec()),
+                est: Rc::new(est),
+            })));
         }
+    }
+}
+
+/// A placeholder spec for runs whose fields did not parse.
+fn blank_spec() -> BuildSpec {
+    BuildSpec {
+        name: "(invalid)".to_string(),
+        kind: AirframeKind::Multirotor,
+        motor: tpt_drone_engine::MotorSpec {
+            kv_rpm_v: 1.0,
+            resistance_ohm: 1.0,
+            no_load_current_a: 0.0,
+            max_current_a: 0.0,
+            weight_g: 0.0,
+        },
+        motor_count: 1,
+        prop: tpt_drone_engine::PropSpec {
+            diameter_in: 1.0,
+            pitch_in: 1.0,
+            blades: 2,
+            weight_g: 0.0,
+        },
+        battery: tpt_drone_engine::BatterySpec {
+            capacity_mah: 1.0,
+            cells_s: 1,
+            pack_resistance_mohm: 0.0,
+            weight_g: 0.0,
+            c_rating: 0.0,
+            usable_fraction: 0.8,
+        },
+        airframe_g: 0.0,
+        payload_g: 0.0,
+        drag_area_m2: 0.0,
+        wing_area_m2: 0.0,
+        wing_span_m: 0.0,
+        cd0: 0.03,
+        oswald_e: 0.8,
+        cl_max: 1.1,
+        cruise_speed_ms: 0.0,
     }
 }
 
@@ -366,12 +577,41 @@ fn blank_estimate() -> Estimate {
     }
 }
 
-/// Opens a URL — new tab in the browser, system browser from the desktop
-/// shell (the host's `open_external` IPC action; without it the webview
-/// would navigate itself away from the local bundle).
+/// Opens a URL. The free edition's wasm runs in a browser tab, where a
+/// normal new-tab open is correct. The Pro edition's *identical* wasm bundle
+/// is instead served over the desktop shell's custom protocol (see
+/// `desktop/src/main.rs`) — there, `window.open` would replace the app
+/// inside the native window with no way back, so the open goes through the
+/// host's allowlisted IPC bridge and the OS default browser. Runtime
+/// protocol sniffing (rather than `#[cfg(feature = "pro")]`) is what
+/// distinguishes the two, since it's the hosting context that matters.
 fn visit_site(url: &str) {
-    let window = web_sys::window().expect("no window");
-    let _ = window.open_with_url_and_target(url, "_blank");
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let in_desktop_shell = window
+        .location()
+        .protocol()
+        .map(|p| p != "http:" && p != "https:")
+        .unwrap_or(false);
+
+    if in_desktop_shell {
+        if let Ok(appfront) = js_sys::Reflect::get(&window, &JsValue::from_str("__appfront")) {
+            if let Ok(post) = js_sys::Reflect::get(&appfront, &JsValue::from_str("post")) {
+                if let Ok(post_fn) = post.dyn_into::<js_sys::Function>() {
+                    let params = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(
+                        &params,
+                        &JsValue::from_str("url"),
+                        &JsValue::from_str(url),
+                    );
+                    let _ = post_fn.call2(&appfront, &JsValue::from_str("open_external"), &params);
+                }
+            }
+        }
+    } else {
+        let _ = window.open_with_url_and_target(url, "_blank");
+    }
 }
 
 /// Shows/hides the fixed-wing fieldset to match the kind select.
@@ -500,9 +740,48 @@ fn input_view() -> UITree<Msg> {
         card_placeholder(b, "drn-results");
         chart_placeholder(b, "drn-chart-holder");
 
+        #[cfg(not(feature = "pro"))]
         upsell_view(b);
+        #[cfg(feature = "pro")]
+        pro_views(b);
         styled_text(b, "drn-foot", "Model class: momentum theory + DC-motor electrical chain, calibrated against published bench data — expect ±25-30% vs a real flight log, not lab precision. No data leaves the page.");
     })
+}
+
+/// (pro) Static shells of the three paid features; the reactive lists and
+/// charts mount into the placeholders from `mount_app`.
+#[cfg(feature = "pro")]
+fn pro_views(b: &mut tpt_appfront_core::ContainerBuilder<Msg>) {
+    b.container(|card| {
+        card.heading(2, "Configuration comparison");
+        styled_text(card, "drn-hint", "Solve a build, then pin it here. Pin up to four builds and race them side by side.");
+        card.container(|actions| {
+            actions.button("Pin current build").class("drn-btn").on_click(Msg::CompareSnapshot);
+            actions.button("Clear").class("drn-ghost").on_click(Msg::CompareClear);
+        }).class("drn-actions");
+        card.container(|_| {}).class("drn-compare");
+    }).class("drn-card");
+
+    b.container(|card| {
+        card.heading(2, "Payload trade-off");
+        styled_text(card, "drn-hint", "Range and endurance as payload increases — the curves end where this build can no longer fly. Updates on every solve.");
+        card.container(|_| {}).class("drn-payload-chart-holder");
+    }).class("drn-card");
+
+    b.container(|card| {
+        card.heading(2, "Saved build profiles");
+        styled_text(card, "drn-hint", "Save the current form under a name, reload and compare builds any time. Stored offline on this machine.");
+        card.container(|row| {
+            row.container(|field| {
+                styled_text(field, "drn-label", "Profile name");
+                field.input("").class("drn-input drn-profile-name").attr("aria-label", "Profile name");
+            }).class("drn-field");
+            row.container(|actions| {
+                actions.button("Save current build").class("drn-btn").on_click(Msg::SaveProfile);
+            }).class("drn-actions");
+        }).class("drn-row");
+        card.container(|_| {}).class("drn-profiles-list");
+    }).class("drn-card");
 }
 
 /// Styled text: the DOM backend renders bare `text` nodes without their
@@ -569,7 +848,7 @@ fn results_view(outcome: Signal<Outcome>) -> UITree<Msg> {
                 styled_text(c, "drn-hint", "Press “Estimate range & endurance”, or load a sample build above.");
             });
         }
-        Outcome::Solved(est) => Rc::clone(est),
+        Outcome::Solved(run) => Rc::clone(&run.est),
     };
 
     UITree::container(|c| {
@@ -749,6 +1028,286 @@ fn draw_envelope_chart(canvas: &web_sys::HtmlCanvasElement, est: &Estimate) -> R
         ("endurance (left)", "#0e7c6b"),
         ("range (right)", "rgba(120,130,150,.9)"),
         ("cruise mark", "rgba(200,120,40,.9)"),
+    ];
+    let mut lx = pad_l + 8.0;
+    for (label, color) in legend {
+        ctx.set_fill_style_str(color);
+        ctx.fill_rect(lx, 4.0, 12.0, 3.0);
+        ctx.set_fill_style_str("#888");
+        let _ = ctx.fill_text(label, lx + 16.0, 10.0);
+        lx += 16.0 + label.len() as f64 * 5.6 + 14.0;
+    }
+    Ok(())
+}
+
+// ---------- (pro) comparison, profiles, payload chart ----------
+
+/// localStorage key prefix for saved profiles.
+#[cfg(feature = "pro")]
+const PROFILE_PREFIX: &str = "drone-range-profile:";
+
+#[cfg(feature = "pro")]
+fn storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+/// All saved profile names, sorted.
+#[cfg(feature = "pro")]
+fn list_profiles() -> Vec<String> {
+    let Some(store) = storage() else {
+        return Vec::new();
+    };
+    let Ok(len) = store.length() else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for i in 0..len {
+        if let Ok(Some(key)) = store.key(i) {
+            if let Some(name) = key.strip_prefix(PROFILE_PREFIX) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Compact one-line spec encoding: `v1|name|kind|n|n|...` in a fixed field
+/// order. Names cannot contain `|` (sanitized at save time).
+#[cfg(feature = "pro")]
+fn encode_spec(spec: &BuildSpec) -> String {
+    let kind = match spec.kind {
+        AirframeKind::Multirotor => "m",
+        AirframeKind::FixedWing => "f",
+    };
+    let g = |v: f64| format!("{v}");
+    [
+        "v1".to_string(),
+        spec.name.clone(),
+        kind.to_string(),
+        g(spec.motor.kv_rpm_v),
+        g(spec.motor.resistance_ohm),
+        g(spec.motor.no_load_current_a),
+        g(spec.motor.max_current_a),
+        g(spec.motor.weight_g),
+        g(spec.prop.diameter_in),
+        g(spec.prop.pitch_in),
+        g(spec.prop.blades as f64),
+        g(spec.prop.weight_g),
+        g(spec.battery.capacity_mah),
+        g(spec.battery.cells_s as f64),
+        g(spec.battery.pack_resistance_mohm),
+        g(spec.battery.weight_g),
+        g(spec.battery.c_rating),
+        g(spec.battery.usable_fraction),
+        g(spec.motor_count as f64),
+        g(spec.airframe_g),
+        g(spec.payload_g),
+        g(spec.drag_area_m2),
+        g(spec.cruise_speed_ms),
+        g(spec.wing_area_m2),
+        g(spec.wing_span_m),
+        g(spec.cd0),
+        g(spec.oswald_e),
+        g(spec.cl_max),
+    ]
+    .join("|")
+}
+
+/// Inverse of [`encode_spec`]; `None` on any malformed field.
+#[cfg(feature = "pro")]
+fn decode_spec(encoded: &str) -> Option<BuildSpec> {
+    let f: Vec<&str> = encoded.split('|').collect();
+    if f.len() != 28 || f[0] != "v1" {
+        return None;
+    }
+    let n = |i: usize| f[i].parse::<f64>().ok();
+    let kind = match f[2] {
+        "m" => AirframeKind::Multirotor,
+        "f" => AirframeKind::FixedWing,
+        _ => return None,
+    };
+    Some(BuildSpec {
+        name: f[1].to_string(),
+        kind,
+        motor: tpt_drone_engine::MotorSpec {
+            kv_rpm_v: n(3)?,
+            resistance_ohm: n(4)?,
+            no_load_current_a: n(5)?,
+            max_current_a: n(6)?,
+            weight_g: n(7)?,
+        },
+        motor_count: n(18)? as u32,
+        prop: tpt_drone_engine::PropSpec {
+            diameter_in: n(8)?,
+            pitch_in: n(9)?,
+            blades: n(10)? as u32,
+            weight_g: n(11)?,
+        },
+        battery: tpt_drone_engine::BatterySpec {
+            capacity_mah: n(12)?,
+            cells_s: n(13)? as u32,
+            pack_resistance_mohm: n(14)?,
+            weight_g: n(15)?,
+            c_rating: n(16)?,
+            usable_fraction: n(17)?,
+        },
+        airframe_g: n(19)?,
+        payload_g: n(20)?,
+        drag_area_m2: n(21)?,
+        cruise_speed_ms: n(22)?,
+        wing_area_m2: n(23)?,
+        wing_span_m: n(24)?,
+        cd0: n(25)?,
+        oswald_e: n(26)?,
+        cl_max: n(27)?,
+    })
+}
+
+/// The reactive comparison table: one column per pinned build.
+#[cfg(feature = "pro")]
+fn compare_view(compare: Signal<Vec<CompareRow>>) -> UITree<Msg> {
+    let rows = compare.get();
+    UITree::container(|c| {
+        if rows.is_empty() {
+            styled_text(c, "drn-hint", "Nothing pinned yet — solve a build, then press “Pin current build”.");
+            return;
+        }
+        c.container(|grid| {
+            for row in &rows {
+                grid.container(|col| {
+                    col.container(|n| {
+                        n.text(row.name.clone());
+                    }).class("n");
+                    let metric_row = |col: &mut tpt_appfront_core::ContainerBuilder<Msg>, label: &str, value: String| {
+                        col.container(|r| {
+                            r.text(value);
+                            r.text(format!(" {}", label));
+                        }).class("r");
+                    };
+                    metric_row(col, "km max range", fmt_num(row.est.max_range_km));
+                    metric_row(col, "min best endurance", fmt_num(row.est.best_endurance_min));
+                    metric_row(col, "km cruise range", fmt_num(row.est.cruise_range_km));
+                    metric_row(col, "g AUW", fmt_num(row.est.all_up_weight_g));
+                    if let Some(hover) = row.est.hover_endurance_min {
+                        metric_row(col, "min hover", fmt_num(hover));
+                    }
+                }).class("drn-compare-col");
+            }
+        }).class("drn-compare-grid");
+    })
+}
+
+/// The reactive saved-profiles list.
+#[cfg(feature = "pro")]
+fn profiles_view(profiles: Signal<Vec<String>>) -> UITree<Msg> {
+    let names = profiles.get();
+    UITree::container(|c| {
+        if names.is_empty() {
+            styled_text(c, "drn-hint", "No saved profiles yet.");
+            return;
+        }
+        for name in names {
+            c.container(|row| {
+                row.container(|pn| {
+                    pn.text(name.clone());
+                }).class("pn");
+                row.button("Load").class("drn-mini").on_click(Msg::LoadProfile(name.clone()));
+                row.button("Delete").class("drn-mini").on_click(Msg::DeleteProfile(name));
+            }).class("drn-profile-row");
+        }
+    })
+}
+
+/// Draws the payload trade-off curves: range and endurance vs payload mass,
+/// ending where the build stops being flyable.
+#[cfg(feature = "pro")]
+fn draw_payload_chart(
+    canvas: &web_sys::HtmlCanvasElement,
+    points: &[tpt_drone_engine::PayloadPoint],
+) -> Result<(), JsValue> {
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("no 2d context"))?
+        .dyn_into::<web_sys::CanvasRenderingContext2d>()
+        .map_err(|_| JsValue::from_str("context cast failed"))?;
+    let w = canvas.width() as f64;
+    let h = canvas.height() as f64;
+    ctx.clear_rect(0.0, 0.0, w, h);
+
+    let flyable: Vec<&tpt_drone_engine::PayloadPoint> =
+        points.iter().filter(|p| p.flyable).collect();
+    if flyable.len() < 2 {
+        return Ok(());
+    }
+    let p_max = flyable.last().unwrap().payload_g;
+    let r_max = flyable.iter().map(|p| p.range_km).fold(0.0, f64::max);
+    let t_max = flyable.iter().map(|p| p.endurance_min).fold(0.0, f64::max);
+    if r_max <= 0.0 || t_max <= 0.0 {
+        return Ok(());
+    }
+    let pad_l = 52.0;
+    let pad_r = 52.0;
+    let pad_t = 14.0;
+    let pad_b = 30.0;
+    let px = |g: f64| pad_l + (w - pad_l - pad_r) * g / p_max;
+    let py_t = |min: f64| h - pad_b - (h - pad_t - pad_b) * min / t_max;
+    let py_r = |km: f64| h - pad_b - (h - pad_t - pad_b) * km / r_max;
+
+    ctx.set_stroke_style_str("#888");
+    ctx.set_line_width(1.0);
+    ctx.begin_path();
+    ctx.move_to(pad_l, pad_t);
+    ctx.line_to(pad_l, h - pad_b);
+    ctx.line_to(w - pad_r, h - pad_b);
+    ctx.stroke();
+
+    ctx.set_font("11px system-ui, sans-serif");
+    ctx.set_fill_style_str("#888");
+    for frac in [0.25, 0.5, 0.75, 1.0] {
+        let y = h - pad_b - (h - pad_t - pad_b) * frac;
+        ctx.set_stroke_style_str("rgba(136,136,136,.25)");
+        ctx.begin_path();
+        ctx.move_to(pad_l, y);
+        ctx.line_to(w - pad_r, y);
+        ctx.stroke();
+        let _ = ctx.fill_text(&format!("{:.0} min", t_max * frac), 2.0, y + 4.0);
+        let _ = ctx.fill_text(&format!("{:.0} km", r_max * frac), w - pad_r + 4.0, y + 4.0);
+    }
+    for frac in [0.0, 0.5, 1.0] {
+        let _ = ctx.fill_text(
+            &format!("{:.0} g", p_max * frac),
+            px(p_max * frac) - 10.0,
+            h - 8.0,
+        );
+    }
+
+    let curve = |select: fn(&tpt_drone_engine::PayloadPoint) -> f64,
+                 map_y: &dyn Fn(f64) -> f64,
+                 color: &str,
+                 width: f64| {
+        ctx.begin_path();
+        let mut started = false;
+        for p in &flyable {
+            let x = px(p.payload_g);
+            let y = map_y(select(p));
+            if started {
+                ctx.line_to(x, y);
+            } else {
+                ctx.move_to(x, y);
+                started = true;
+            }
+        }
+        ctx.set_stroke_style_str(color);
+        ctx.set_line_width(width);
+        ctx.stroke();
+    };
+    curve(|p| p.endurance_min, &py_t, "#0e7c6b", 2.4);
+    curve(|p| p.range_km, &py_r, "rgba(120,130,150,.9)", 2.0);
+
+    let legend = [
+        ("endurance (left)", "#0e7c6b"),
+        ("range (right)", "rgba(120,130,150,.9)"),
     ];
     let mut lx = pad_l + 8.0;
     for (label, color) in legend {

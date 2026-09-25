@@ -31,7 +31,7 @@ pub use estimate::{Estimate, SolveIssue, SpeedPoint};
 pub use physics::{Constants, HoverPoint, MotorModel, PowerTrain, PropModel};
 pub use preset::{AirframeKind, BatterySpec, BuildSpec, MotorSpec, PropSpec, SAMPLE_BUILDS};
 #[cfg(feature = "pro")]
-pub use sweep::PayloadPoint;
+pub use sweep::{payload_sweep, PayloadPoint};
 
 /// Air density used throughout (ISA sea level, 15 °C), kg/m³.
 pub const AIR_DENSITY: f64 = 1.225;
